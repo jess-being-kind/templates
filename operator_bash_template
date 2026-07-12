@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# operator_bash_template.sh
+#
+# Generic Bash template for engineering/operator automation.
+#
+# Pattern:
+#   parse_args -> validate_config -> run_workflow
+#
+# Operator rules:
+#   - Dry-run is default for risky actions.
+#   - All side effects go through run_cmd/write_file.
+#   - Quote variables unless you intentionally want word splitting.
+#   - Use arrays for commands instead of eval.
+#   - Keep main guarded so tests can source this file.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# =============================================================================
+# region S0. Metadata / globals
+# =============================================================================
+
+VERSION="3.1.0"
+AUTHOR="V Halcyon"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "${SCRIPT_PATH}")"
+RUN_ID="$(date -u +"%Y%m%d_%H%M%S_UTC")"
+
+APPLY=0                 # Default: dry-run. Use --apply to change the world.
+VERBOSE=0
+FORCE=0
+SELF_TEST=0
+INPUT_PATH=""
+VEC_ROOT="${VEC_ROOT:-${HOME}/Vec}"
+ENGINEERING_DIR="${ENGINEERING_DIR:-${VEC_ROOT}/Engineering}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ENGINEERING_DIR}/logs/bash/${SCRIPT_NAME%.sh}}"
+
+# endregion
+
+# =============================================================================
+# region S1. Logging / errors
+# =============================================================================
+
+supports_color() { [[ -t 1 && "${NO_COLOR:-}" == "" ]]; }
+_color() { supports_color && printf '\033[%sm' "$1" || true; }
+_reset() { supports_color && printf '\033[0m' || true; }
+
+log()   { printf "%s[OK]%s %s\n" "$(_color '1;32')" "$(_reset)" "$*"; }
+info()  { printf "%s[INFO]%s %s\n" "$(_color '1;34')" "$(_reset)" "$*"; }
+warn()  { printf "%s[WARN]%s %s\n" "$(_color '1;33')" "$(_reset)" "$*" >&2; }
+err()   { printf "%s[ERR]%s %s\n" "$(_color '1;31')" "$(_reset)" "$*" >&2; }
+debug() { (( VERBOSE )) && printf "%s[DEBUG]%s %s\n" "$(_color '0;36')" "$(_reset)" "$*" >&2 || true; }
+die() { err "$*"; exit 1; }
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+on_error() {
+    local status=$?
+    local line=${BASH_LINENO[0]:-unknown}
+    err "Failed at line ${line} with status ${status}."
+    exit "$status"
+}
+trap on_error ERR
+
+cleanup() {
+    local status=$?
+    (( status == 0 )) && debug "Cleanup complete." || warn "Script exited with status ${status}."
+}
+trap cleanup EXIT
+
+# endregion
+
+# =============================================================================
+# region S2. Small validation helpers
+# =============================================================================
+
+require_command() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
+assert_file_exists() { [[ -f "$1" ]] || die "Expected file does not exist: $1"; }
+assert_dir_exists() { [[ -d "$1" ]] || die "Expected directory does not exist: $1"; }
+is_positive_integer() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
+is_yes() { case "${1,,}" in y|yes|true|1|on) return 0 ;; *) return 1 ;; esac; }
+
+path_prepend() {
+    local dir="${1:?path_prepend requires a directory}"
+    [[ -d "$dir" ]] || return 0
+    case ":$PATH:" in *":$dir:"*) ;; *) export PATH="$dir:$PATH" ;; esac
+}
+
+#endregion
+
+# =============================================================================
+# region S3. Path / file helpers
+# =============================================================================
+
+ensure_dir() { run_cmd mkdir -p "$1"; }
+
+backup_if_exists() {
+    local path="$1"
+    [[ -e "$path" || -L "$path" ]] || return 0
+    local backup="${path}.bak.${RUN_ID}"
+    warn "Backing up existing path: $path -> $backup"
+    run_cmd cp -a "$path" "$backup"
+}
+
+write_file() {
+    local path="$1"
+    local content="$2"
+    if [[ -e "$path" && "$FORCE" -ne 1 ]]; then
+        warn "File exists, skipping: $path  Use --force to replace after backup."
+        return 0
+    fi
+    ensure_dir "$(dirname "$path")"
+    [[ -e "$path" || -L "$path" ]] && backup_if_exists "$path"
+    if (( APPLY )); then
+        local tmp="${path}.tmp.$$"
+        printf "%s" "$content" > "$tmp"
+        mv "$tmp" "$path"
+        log "Wrote $path"
+    else
+        printf "[DRY RUN] write %q\n" "$path"
+    fi
+}
+
+write_file_stream() {
+    local path="$1"
+    local content
+    content="$(cat)"
+    write_file "$path" "$content"$'\n'
+}
+
+# endregion
+
+# =============================================================================
+# region S4. Command execution
+# =============================================================================
+
+run_cmd() {
+    if (( APPLY )); then
+        debug "RUN: $(printf '%q ' "$@")"
+        "$@"
+    else
+        printf "[DRY RUN] "
+        printf "%q " "$@"
+        printf "\n"
+    fi
+}
+
+capture_cmd() {
+    debug "CAPTURE: $(printf '%q ' "$@")"
+    "$@"
+}
+
+# endregion
+
+# =============================================================================
+# region S5. Text / list helpers
+# =============================================================================
+
+join_by() {
+    local delimiter="$1"; shift || true
+    local first=1 item
+    for item in "$@"; do
+        if (( first )); then printf "%s" "$item"; first=0; else printf "%s%s" "$delimiter" "$item"; fi
+    done
+}
+
+split_csv() {
+    local csv="${1:-}" item
+    IFS=',' read -r -a _items <<< "$csv"
+    for item in "${_items[@]}"; do
+        item="${item#${item%%[![:space:]]*}}"
+        item="${item%${item##*[![:space:]]}}"
+        [[ -n "$item" ]] && printf "%s\n" "$item"
+    done
+}
+
+# endregion
+
+# =============================================================================
+# region S6. Manifest / summary helpers
+# =============================================================================
+
+make_run_manifest() {
+    cat <<MANIFEST
+version=$VERSION
+author=$AUTHOR
+run_id=$RUN_ID
+timestamp=$(timestamp)
+script=$SCRIPT_NAME
+script_path=$SCRIPT_PATH
+script_dir=$SCRIPT_DIR
+input_path=$INPUT_PATH
+output_dir=$OUTPUT_DIR
+apply=$APPLY
+force=$FORCE
+verbose=$VERBOSE
+MANIFEST
+}
+
+write_summary() {
+    local path="$1"
+    local status="$2"
+    write_file_stream "$path" <<SUMMARY
+status=$status
+run_id=$RUN_ID
+timestamp=$(timestamp)
+output_dir=$OUTPUT_DIR
+SUMMARY
+}
+
+# endregion
+
+# =============================================================================
+# region S7. CLI
+# =============================================================================
+
+
+usage() {
+    cat <<USAGE
+Usage: $SCRIPT_NAME [options]
+
+Options:
+  --apply                 Actually perform actions. Default is dry-run.
+  --dry-run               Print actions without changing anything.
+  --input PATH            Optional input file or directory.
+  --output-dir DIR        Output directory. Default: $OUTPUT_DIR
+  --force                 Replace generated files after backing them up.
+  -v, --verbose           Enable debug logging.
+  --self-test             Run a smoke test in /tmp.
+  --version               Print version.
+  -h, --help              Show this help.
+
+Examples:
+  $SCRIPT_NAME --input data/raw/example.csv
+  $SCRIPT_NAME --apply --input data/raw/example.csv --output-dir output
+  $SCRIPT_NAME --self-test
+
+Syntax crib:
+  Array command:   cmd=(python3 script.py --input "$INPUT_PATH"); run_cmd "\${cmd[@]}"
+  If test:         if [[ -f "$INPUT_PATH" ]]; then log "exists"; fi
+  Loop files:      while IFS= read -r file; do echo "$file"; done < <(find . -type f)
+  Arithmetic:      if (( count > 3 )); then warn "large"; fi
+  Case matching:   case "$arg" in start|stop) ;; *) die "bad" ;; esac
+USAGE
+}
+
+parse_args() {
+    while (($#)); do
+        case "$1" in
+            --apply) APPLY=1 ;;
+            --dry-run|--no-load-run) APPLY=0 ;;
+            --input) shift || die "Missing value for --input"; INPUT_PATH="${1:?missing value for --input}" ;;
+            --output-dir) shift || die "Missing value for --output-dir"; OUTPUT_DIR="${1:?missing value for --output-dir}" ;;
+            --force) FORCE=1 ;;
+            -v|--verbose) VERBOSE=1 ;;
+            --self-test) SELF_TEST=1 ;;
+            --version) printf "%s\n" "$VERSION"; exit 0 ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Unknown argument: $1" ;;
+        esac
+        shift
+    done
+}
+
+validate_config() {
+    [[ -n "$OUTPUT_DIR" ]] || die "--output-dir cannot be empty"
+    if [[ -n "$INPUT_PATH" ]]; then
+        [[ -e "$INPUT_PATH" ]] || die "--input does not exist: $INPUT_PATH"
+    else
+        warn "No --input provided; continuing with template behavior."
+    fi
+}
+
+# endregion
+
+# =============================================================================
+# region S8. Workflow
+# =============================================================================
+
+run_workflow() {
+    info "Starting workflow"
+    info "Run ID: $RUN_ID"
+    ensure_dir "$OUTPUT_DIR/logs"
+    ensure_dir "$OUTPUT_DIR/artifacts"
+
+    write_file "$OUTPUT_DIR/logs/run_manifest_${RUN_ID}.txt" "$(make_run_manifest)"
+
+    # Replace this section with the actual mission.
+    # Examples:
+    #   run_cmd cp "$INPUT_PATH" "$OUTPUT_DIR/artifacts/"
+    #   cmd=(python3 analyze.py --input "$INPUT_PATH" --output-dir "$OUTPUT_DIR")
+    #   run_cmd "${cmd[@]}"
+    #   run_cmd mpremote cp firmware/main.py :/main.py
+
+    write_summary "$OUTPUT_DIR/logs/summary_${RUN_ID}.txt" "ok"
+    log "Template workflow complete"
+}
+
+run_self_test() {
+    local tmp_dir old_apply old_output
+    tmp_dir="$(mktemp -d)"
+    info "Self-test temp dir: $tmp_dir"
+    old_apply="$APPLY"
+    old_output="$OUTPUT_DIR"
+    APPLY=1
+    OUTPUT_DIR="$tmp_dir/output"
+    INPUT_PATH=""
+    validate_config
+    run_workflow
+    assert_file_exists "$OUTPUT_DIR/logs/run_manifest_${RUN_ID}.txt"
+    assert_file_exists "$OUTPUT_DIR/logs/summary_${RUN_ID}.txt"
+    APPLY="$old_apply"
+    OUTPUT_DIR="$old_output"
+    rm -rf "$tmp_dir"
+    log "Self-test passed"
+}
+
+# endregion
+
+# =============================================================================
+# region S9. Main
+# =============================================================================
+
+main() {
+    parse_args "$@"
+    if (( SELF_TEST )); then
+        run_self_test
+    else
+        validate_config
+        run_workflow
+    fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
+
+#endregion
