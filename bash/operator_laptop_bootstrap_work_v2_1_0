@@ -1,0 +1,1585 @@
+#!/usr/bin/env bash
+# operator_laptop_bootstrap_v2.1.0.sh
+#
+# Mint/Ubuntu-style operator laptop bootstrap.
+#
+# Design rules:
+#   - Dry-run by default. Nothing changes unless you pass --apply.
+#   - Safe on a partially configured home laptop.
+#   - Existing generated config files are skipped unless --force is passed.
+#   - Existing files are backed up before replacement when --force is used.
+#   - Engineering workspace lives under ~/Vec/Engineering, but folder names stay normal.
+#   - Halcyon dark color tokens are written once and reused by shell, Terminator,
+#     GTK/app preferences, matplotlib, Obsidian snippets, and optional VS Code config.
+#
+# Example:
+#   bash operator_laptop_bootstrap_v2.1.0.sh
+#   bash operator_laptop_bootstrap_v2.1.0.sh --apply --no-install
+#   bash operator_laptop_bootstrap_v2.1.0.sh --apply --force
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ==============================================================================
+# S0: Metadata + default configuration
+# ==============================================================================
+
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_ID="$(date +"%Y%m%d_%H%M%S")"
+
+AUTHOR="V Halcyon"
+VERSION="2.1.0"
+
+# Dry-run by default.
+APPLY=0
+FORCE=0
+VERBOSE=0
+
+# Install toggles.
+DO_INSTALL=1
+INSTALL_OBSIDIAN=1
+APPLY_SYSTEM_THEME=1
+SET_VSCODE_USER_SETTINGS=1
+VEC_ROOT_CUSTOM=1
+VAULT_CUSTOM=1
+ENGINEERING_CUSTOM=1
+
+# User-tunable roots.
+# Vec is the top-level home base; engineering folders under it keep normal names.
+VEC_ROOT="${VEC_ROOT:-$HOME/Vec}"
+VAULT_DIR="${VAULT_DIR:-$VEC_ROOT/Vaults/Work}"
+ENGINEERING_DIR="${ENGINEERING_DIR:-$VEC_ROOT/Engineering}"
+
+# Common managed paths.
+LOCAL_BIN="$HOME/.local/bin"
+HALCYON_CONFIG_DIR="$HOME/.config/halcyon"
+MANIFEST_DIR="$ENGINEERING_DIR/logs/bootstrap"
+
+# Halcyon dark palette: soot / amber / signal-blue / moss green.
+# Canonical names are the aesthetic tokens; compatibility aliases keep older
+# config writers working without rewriting every downstream template.
+HALCYON_SOOT="#07090D"
+HALCYON_SOOT_ALT="#0B1118"
+HALCYON_PANEL="#11151C"
+HALCYON_TEXT="#F2E8D5"
+HALCYON_MUTED="#9AA0AA"
+HALCYON_AMBER="#FFBF00"
+HALCYON_BRASS="#B88746"
+HALCYON_SIGNAL_BLUE="#4FA3B8"
+HALCYON_MOSS="#8FA37A"
+HALCYON_RUST="#B7410E"
+HALCYON_MAROON="#6E2F35"
+HALCYON_CYAN="#76B7B2"
+HALCYON_PURPLE="#A77BD4"
+
+# Compatibility aliases used by existing generated configs.
+HALCYON_BG="$HALCYON_SOOT"
+HALCYON_BG_ALT="$HALCYON_SOOT_ALT"
+HALCYON_FG="$HALCYON_TEXT"
+HALCYON_GOLD="$HALCYON_AMBER"
+HALCYON_RED="$HALCYON_RUST"
+HALCYON_GREEN="$HALCYON_MOSS"
+HALCYON_BLUE="$HALCYON_SIGNAL_BLUE"
+
+# ==============================================================================
+# S1: Small logging and safety helpers
+# ==============================================================================
+
+log()   { printf "\033[1;32m[OK]\033[0m %s\n" "$*"; }
+info()  { printf "\033[1;34m[INFO]\033[0m %s\n" "$*"; }
+warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
+err()   { printf "\033[1;31m[ERR]\033[0m %s\n" "$*" >&2; }
+debug() { if (( VERBOSE )); then printf "\033[0;36m[DEBUG]\033[0m %s\n" "$*"; fi; return 0; }
+
+die() { err "$*"; exit 1; }
+stamp(){ date +"%Y%m%d_%H%M%S"; }
+timestamp(){ date +"%Y-%m-%dT%H:%M:%S%z"; }
+
+# run: the main side-effect gate. In dry-run mode it prints the command instead
+# of executing it. Keep side effects behind this unless a command must be handled
+# specially, like appending to a file.
+run(){
+  if (( APPLY )); then
+    debug "RUN: $*"
+    "$@"
+  else
+    printf '[DRY RUN] '
+    printf '%q ' "$@"
+    printf '\n'
+  fi
+}
+
+# run_optional: same idea as run, but failures are warnings instead of fatal.
+# Useful for desktop/theme commands that may not exist on every Mint/Ubuntu setup.
+run_optional(){
+  if (( APPLY )); then
+    debug "TRY: $*"
+    "$@" || warn "Optional command failed or is unsupported: $*"
+  else
+    printf '[DRY RUN optional] '
+    printf '%q ' "$@"
+    printf '\n'
+  fi
+}
+
+ensure_dir(){
+  # Creates a directory only through the run gate.
+  local dir="$1"
+  run mkdir -p "$dir"
+}
+
+backup_if_exists(){
+  # Back up an existing file/path before replacing it.
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    local backup="${path}.bak.$(stamp)"
+    warn "Backing up existing path: $path -> $backup"
+    run cp -a "$path" "$backup"
+  fi
+}
+
+write_file(){
+  # Write a managed file.
+  # Safety behavior:
+  #   - If the file exists and --force is not set, skip it.
+  #   - If the file exists and --force is set, back it up first.
+  local path="$1"
+  local content="$2"
+
+  ensure_dir "$(dirname "$path")"
+
+  if [[ -e "$path" && "$FORCE" -ne 1 ]]; then
+    warn "Exists, skipping: $path  Use --force to replace."
+    return 0
+  fi
+
+  if [[ -e "$path" ]]; then
+    backup_if_exists "$path"
+  fi
+
+  if (( APPLY )); then
+    printf '%s' "$content" > "$path"
+    log "Wrote $path"
+  else
+    echo "[DRY RUN] write $path"
+  fi
+}
+
+write_file_stream(){
+  # Read file content from stdin and pass it to write_file.
+  # This keeps generated config files readable and avoids quoting accidents.
+  local path="$1"
+  local content
+  content="$(cat)"
+  write_file "$path" "$content"$'
+'
+}
+
+append_once(){
+  # Append a line to a file only if it is not already present.
+  # This is how we safely modify ~/.bashrc on a laptop that already has setup.
+  local path="$1"
+  local marker="$2"
+  local line="$3"
+
+  ensure_dir "$(dirname "$path")"
+
+  if [[ -f "$path" ]] && grep -Fq "$marker" "$path"; then
+    log "$path already contains: $marker"
+    return 0
+  fi
+
+  if (( APPLY )); then
+    printf '\n%s\n%s\n' "$marker" "$line" >> "$path"
+    log "Appended to $path: $marker"
+  else
+    echo "[DRY RUN] append to $path: $marker"
+  fi
+}
+
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
+
+# ==============================================================================
+# S2: CLI options
+# ==============================================================================
+
+usage(){ cat <<EOF
+Usage: bash $SCRIPT_NAME [options]
+
+Operator laptop bootstrap v$VERSION.
+Dry-run by default. Use --apply to make changes.
+
+Options:
+  --apply                 Actually make changes. Default is dry-run.
+  --dry-run               Print actions without changing anything.
+  --force                 Replace generated config files after making backups.
+  --no-install            Skip apt/flatpak install steps.
+  --no-obsidian           Skip Obsidian Flatpak install.
+  --no-system-theme       Skip live gsettings theme changes; still writes config files.
+  --no-vscode-user        Do not write ~/.config/Code/User/settings.json.
+  --vec-root DIR          Top-level Vec directory. Default: $VEC_ROOT
+  --vault DIR             Vault path. Default: $VAULT_DIR
+  --engineering DIR       Engineering dir. Default: $ENGINEERING_DIR
+  -v, --verbose           Enable debug logging.
+  -h, --help              Show help.
+
+Examples:
+  bash $SCRIPT_NAME
+  bash $SCRIPT_NAME --apply --no-install
+  bash $SCRIPT_NAME --apply --force
+  bash $SCRIPT_NAME --apply --vec-root "\$HOME/Vec"
+EOF
+}
+
+parse_args(){
+  while (($#)); do
+    case "$1" in
+      --apply) APPLY=1 ;;
+      --dry-run) APPLY=0 ;;
+      --force) FORCE=1 ;;
+      --no-install) DO_INSTALL=0 ;;
+      --no-obsidian) INSTALL_OBSIDIAN=0 ;;
+      --no-system-theme) APPLY_SYSTEM_THEME=0 ;;
+      --no-vscode-user) SET_VSCODE_USER_SETTINGS=0 ;;
+      --vec-root) shift; VEC_ROOT="${1:?missing path}"; VEC_ROOT_CUSTOM=1 ;;
+      --vault) shift; VAULT_DIR="${1:?missing path}"; VAULT_CUSTOM=1 ;;
+      --engineering) shift; ENGINEERING_DIR="${1:?missing path}"; ENGINEERING_CUSTOM=1 ;;
+      -v|--verbose) VERBOSE=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) err "Unknown option: $1"; usage; exit 1 ;;
+    esac
+    shift
+  done
+
+  # Recompute derived paths after CLI overrides.
+  # If only --vec-root is changed, keep engineering/vault under that new root.
+  if (( VEC_ROOT_CUSTOM )) && (( ! ENGINEERING_CUSTOM )); then
+    ENGINEERING_DIR="$VEC_ROOT/Engineering"
+  fi
+  if (( VEC_ROOT_CUSTOM )) && (( ! VAULT_CUSTOM )); then
+    VAULT_DIR="$VEC_ROOT/Vaults/Work"
+  fi
+  LOCAL_BIN="$HOME/.local/bin"
+  HALCYON_CONFIG_DIR="$HOME/.config/halcyon"
+  MANIFEST_DIR="$ENGINEERING_DIR/logs/bootstrap"
+}
+
+# ==============================================================================
+# S3: Explicit plan for partial-home-laptop safety
+# ==============================================================================
+
+print_change_plan(){
+  cat <<EOF
+
+===============================================================================
+Operator laptop bootstrap v$VERSION — planned changes
+===============================================================================
+
+Mode:
+  APPLY=$APPLY
+  FORCE=$FORCE
+  DO_INSTALL=$DO_INSTALL
+  INSTALL_OBSIDIAN=$INSTALL_OBSIDIAN
+  APPLY_SYSTEM_THEME=$APPLY_SYSTEM_THEME
+  SET_VSCODE_USER_SETTINGS=$SET_VSCODE_USER_SETTINGS
+
+Workspace roots:
+  Vec root:     $VEC_ROOT
+  Engineering:  $ENGINEERING_DIR
+  Vault:        $VAULT_DIR
+
+Safety rules:
+  - Dry-run prints actions only.
+  - Existing generated files are skipped unless --force is used.
+  - With --force, existing generated files are backed up as *.bak.<timestamp>.
+  - ~/.bashrc is only appended with source lines if those exact lines are missing.
+  - Package installation can be skipped with --no-install.
+
+Managed files/configs:
+  $HOME/.operator_aliases
+  $HOME/.inputrc
+  $HOME/.bashrc source lines
+  $HALCYON_CONFIG_DIR/colors.env
+  $HOME/.config/gtk-3.0/settings.ini
+  $HOME/.config/gtk-4.0/settings.ini
+  $HOME/.Xresources
+  $HOME/.config/terminator/config
+  $HOME/.config/matplotlib/stylelib/halcyon-dark.mplstyle
+  $HOME/.config/Code/User/settings.json  [skipped if --no-vscode-user]
+  $VAULT_DIR/.obsidian/*
+  $VAULT_DIR/80-Templates/*
+  $LOCAL_BIN/operator-status
+  $LOCAL_BIN/cleanup-downloads
+  $LOCAL_BIN/vecbin
+  $LOCAL_BIN/csvpeek
+
+Theme intent:
+  - Prefer dark mode for GTK/GNOME/Cinnamon-compatible apps when supported.
+  - Apply Halcyon-dark palette to Terminator, Obsidian CSS snippet, matplotlib,
+    shell prompt, ls/grep/GCC/man colors, and optional VS Code user settings.
+  - Interactive cd lists the target directory after successful movement.
+  - Some apps may need a restart to pick up theme/config changes.
+
+EOF
+}
+
+# ==============================================================================
+# S4: Package installation
+# ==============================================================================
+
+install_packages(){
+  if (( ! DO_INSTALL )); then
+    warn "Skipping package installation."
+    return 0
+  fi
+
+  if ! have_cmd apt; then
+    warn "apt not found; skipping package installation."
+    return 0
+  fi
+
+  # Practical operator package set: coding, search, terminals, hardware, sensors,
+  # file management, clipboard, and troubleshooting basics.
+  local packages=(
+    build-essential git curl wget ca-certificates gnupg unzip zip tree
+    htop btop jq ripgrep fd-find fzf tmux terminator shellcheck
+    python3 python3-pip python3-venv python3-serial python3-tk
+    usbutils pciutils i2c-tools lm-sensors stress s-tui flatpak copyq
+    ncdu xclip xsel flameshot pavucontrol gnome-disk-utility moreutils rename
+  )
+
+  info "Installing core packages"
+  run sudo apt update
+  run sudo apt install -y "${packages[@]}"
+
+  if (( INSTALL_OBSIDIAN )); then
+    info "Installing Obsidian using Flatpak/Flathub"
+    run flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+    run flatpak install -y flathub md.obsidian.Obsidian
+  else
+    warn "Skipping Obsidian install."
+  fi
+}
+
+# ==============================================================================
+# S5: Workspace directories
+# ==============================================================================
+
+setup_dirs(){
+  info "Creating workspace directories"
+
+  # Normal engineering folder names, placed under ~/Vec/Engineering by default.
+  local dirs=(
+    "$VEC_ROOT"
+    "$LOCAL_BIN"
+    "$HOME/Vaults"
+    "$VEC_ROOT/Vaults"
+    "$VAULT_DIR"
+    "$ENGINEERING_DIR"
+    "$ENGINEERING_DIR/projects/active"
+    "$ENGINEERING_DIR/projects/archive"
+    "$ENGINEERING_DIR/python"
+    "$ENGINEERING_DIR/VSCode"
+    "$ENGINEERING_DIR/scripts"
+    "$ENGINEERING_DIR/testReports"
+    "$ENGINEERING_DIR/data/raw"
+    "$ENGINEERING_DIR/data/processed"
+    "$ENGINEERING_DIR/data/plots"
+    "$ENGINEERING_DIR/logs"
+    "$ENGINEERING_DIR/logs/bootstrap"
+    "$ENGINEERING_DIR/parts"
+    "$ENGINEERING_DIR/datasheets"
+    "$ENGINEERING_DIR/templates"
+    "$ENGINEERING_DIR/fieldNotes"
+    "$ENGINEERING_DIR/portfolio"
+    "$ENGINEERING_DIR/scratch"
+    "$ENGINEERING_DIR/interviewPrep"
+    "$ENGINEERING_DIR/reliability"
+    "$ENGINEERING_DIR/bench"
+    "$ENGINEERING_DIR/bench/sensorData"
+    "$ENGINEERING_DIR/bench/micropython"
+    "$ENGINEERING_DIR/hil_sil"
+    "$ENGINEERING_DIR/references"
+  )
+
+  for d in "${dirs[@]}"; do ensure_dir "$d"; done
+}
+
+# ==============================================================================
+# S6: Halcyon-dark system/theme layer
+# ==============================================================================
+
+setup_halcyon_color_tokens(){
+  info "Writing Halcyon-dark color tokens"
+
+  write_file_stream "$HALCYON_CONFIG_DIR/colors.env" <<EOF
+# Halcyon dark palette for shell/scripts/tools.
+# Source from Bash with:
+#   [[ -f "\$HOME/.config/halcyon/colors.env" ]] && source "\$HOME/.config/halcyon/colors.env"
+
+export HALCYON_THEME="halcyon-dark"
+
+# Canonical aesthetic tokens.
+export HALCYON_SOOT="$HALCYON_SOOT"
+export HALCYON_SOOT_ALT="$HALCYON_SOOT_ALT"
+export HALCYON_PANEL="$HALCYON_PANEL"
+export HALCYON_TEXT="$HALCYON_TEXT"
+export HALCYON_MUTED="$HALCYON_MUTED"
+export HALCYON_AMBER="$HALCYON_AMBER"
+export HALCYON_BRASS="$HALCYON_BRASS"
+export HALCYON_SIGNAL_BLUE="$HALCYON_SIGNAL_BLUE"
+export HALCYON_MOSS="$HALCYON_MOSS"
+export HALCYON_RUST="$HALCYON_RUST"
+export HALCYON_MAROON="$HALCYON_MAROON"
+export HALCYON_CYAN="$HALCYON_CYAN"
+export HALCYON_PURPLE="$HALCYON_PURPLE"
+
+# Compatibility aliases for older scripts/configs.
+export HALCYON_BG="$HALCYON_BG"
+export HALCYON_BG_ALT="$HALCYON_BG_ALT"
+export HALCYON_FG="$HALCYON_FG"
+export HALCYON_GOLD="$HALCYON_GOLD"
+export HALCYON_RED="$HALCYON_RED"
+export HALCYON_GREEN="$HALCYON_GREEN"
+export HALCYON_BLUE="$HALCYON_BLUE"
+
+# 256-color ANSI approximations used by Bash prompt, grep, ls, GCC, and man/less.
+export HALCYON_ANSI_SOOT="232"
+export HALCYON_ANSI_PANEL="233"
+export HALCYON_ANSI_TEXT="230"
+export HALCYON_ANSI_AMBER="214"
+export HALCYON_ANSI_BRASS="172"
+export HALCYON_ANSI_SIGNAL_BLUE="39"
+export HALCYON_ANSI_MOSS="107"
+export HALCYON_ANSI_RUST="166"
+EOF
+}
+setup_system_theme(){
+  info "Applying Halcyon-dark app/system preference layer"
+
+  # GTK settings files influence many Linux desktop apps. They are safe text files
+  # and do not require the target theme package to be installed.
+  write_file_stream "$HOME/.config/gtk-3.0/settings.ini" <<'EOF'
+[Settings]
+gtk-application-prefer-dark-theme=1
+gtk-theme-name=Mint-Y-Dark
+gtk-icon-theme-name=Mint-Y-Sand
+gtk-font-name=Sans 10
+gtk-cursor-theme-size=24
+EOF
+
+  write_file_stream "$HOME/.config/gtk-4.0/settings.ini" <<'EOF'
+[Settings]
+gtk-application-prefer-dark-theme=1
+gtk-theme-name=Mint-Y-Dark
+gtk-icon-theme-name=Mint-Y-Sand
+gtk-font-name=Sans 10
+gtk-cursor-theme-size=24
+EOF
+
+  # Xresources is useful for older X11-aware apps and some terminal tools.
+  write_file_stream "$HOME/.Xresources" <<EOF
+! Halcyon dark Xresources
+*.background: $HALCYON_BG
+*.foreground: $HALCYON_FG
+*.cursorColor: $HALCYON_GOLD
+*.color0:  #1b1b1b
+*.color1:  $HALCYON_RED
+*.color2:  $HALCYON_GREEN
+*.color3:  $HALCYON_GOLD
+*.color4:  $HALCYON_BLUE
+*.color5:  $HALCYON_PURPLE
+*.color6:  $HALCYON_CYAN
+*.color7:  $HALCYON_FG
+*.color8:  #5c6370
+*.color9:  #d98f84
+*.color10: #a3be8c
+*.color11: #e8c16a
+*.color12: #8fb7d6
+*.color13: #c7a0d9
+*.color14: #9bd3df
+*.color15: #fff4df
+EOF
+
+  # Live desktop preference changes. These are optional because schemas vary
+  # between GNOME, Cinnamon, Mint, Xfce, etc. Failures are non-fatal.
+  if (( APPLY_SYSTEM_THEME )); then
+    if have_cmd gsettings; then
+      run_optional gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+      run_optional gsettings set org.gnome.desktop.interface gtk-theme Mint-Y-Dark
+      run_optional gsettings set org.gnome.desktop.interface icon-theme Mint-Y-Sand
+      run_optional gsettings set org.cinnamon.desktop.interface gtk-theme Mint-Y-Dark
+      run_optional gsettings set org.cinnamon.desktop.interface icon-theme Mint-Y-Sand
+    else
+      warn "gsettings not found; wrote GTK config files only."
+    fi
+  else
+    warn "Skipping live system theme commands because --no-system-theme was set."
+  fi
+}
+
+setup_mplstyle(){
+  info "Creating matplotlib Halcyon-dark style"
+
+  write_file_stream "$HOME/.config/matplotlib/stylelib/halcyon-dark.mplstyle" <<EOF
+# halcyon-dark matplotlib style
+# Use in Python with:
+#   import matplotlib.pyplot as plt
+#   plt.style.use('halcyon-dark')
+
+figure.facecolor: $HALCYON_BG
+axes.facecolor: $HALCYON_BG
+axes.edgecolor: $HALCYON_MUTED
+axes.labelcolor: $HALCYON_FG
+axes.titlecolor: $HALCYON_GOLD
+xtick.color: $HALCYON_FG
+ytick.color: $HALCYON_FG
+text.color: $HALCYON_FG
+grid.color: #2a3140
+grid.alpha: 0.45
+axes.grid: True
+legend.facecolor: $HALCYON_PANEL
+legend.edgecolor: $HALCYON_MUTED
+savefig.facecolor: $HALCYON_BG
+savefig.edgecolor: $HALCYON_BG
+lines.linewidth: 2.0
+patch.edgecolor: $HALCYON_BG
+image.cmap: inferno
+axes.prop_cycle: cycler('color', ['$HALCYON_GOLD', '$HALCYON_BLUE', '$HALCYON_GREEN', '$HALCYON_RED', '$HALCYON_CYAN', '$HALCYON_PURPLE', '$HALCYON_AMBER'])
+EOF
+}
+
+# ==============================================================================
+# S7: Shell helpers and Bash quality-of-life layer
+# ==============================================================================
+
+setup_shell(){
+  info "Creating shell helpers"
+
+  # This file is generated and safe to replace with --force. It uses normal folder
+  # names under ~/Vec/Engineering and keeps aliases/functions non-destructive.
+  write_file_stream "$HOME/.operator_aliases" <<'EOF'
+# ~/.operator_aliases
+# Generated by operator_laptop_bootstrap.
+# Purpose: interactive shell behavior, prompt, aliases, and Halcyon colors.
+# Safe to edit, but rerunning bootstrap with --force will back it up.
+
+# -----------------------------------------------------------------------------
+# S0. Guardrails / tiny interactive helpers
+# -----------------------------------------------------------------------------
+
+# Pull in shared Halcyon colors for prompt/scripts/tools.
+[[ -f "$HOME/.config/halcyon/colors.env" ]] && source "$HOME/.config/halcyon/colors.env"
+
+# Let Ctrl+S be used by readline instead of terminal flow-control freeze.
+stty -ixon 2>/dev/null || true
+
+# Core paths. These resolve under ~/Vec by default but can be overridden before sourcing.
+export VEC_ROOT="${VEC_ROOT:-$HOME/Vec}"
+export ENGINEERING_DIR="${ENGINEERING_DIR:-$VEC_ROOT/Engineering}"
+export VAULT_DIR="${VAULT_DIR:-$VEC_ROOT/Vaults/Work}"
+
+path_prepend() {
+  local dir="${1:?path_prepend requires a directory}"
+  [[ -d "$dir" ]] || return 0
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) export PATH="$dir:$PATH" ;;
+  esac
+}
+
+path_prepend "$HOME/.local/bin"
+path_prepend "$HOME/bin"
+path_prepend "$ENGINEERING_DIR/bin"
+path_prepend "$ENGINEERING_DIR/scripts"
+
+# Editor / pager / Python defaults.
+export EDITOR="${EDITOR:-vim}"
+export VISUAL="${VISUAL:-$EDITOR}"
+export PAGER="${PAGER:-less}"
+export LESS="${LESS:--FRX}"
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+
+# Keep terminal history useful across multiple open terminals.
+export HISTSIZE=20000
+export HISTFILESIZE=50000
+export HISTCONTROL=ignoreboth:erasedups
+export HISTTIMEFORMAT='%F %T  '
+shopt -s histappend 2>/dev/null || true
+__halcyon_history_sync='history -a; history -n'
+if [[ -n "${PROMPT_COMMAND:-}" ]]; then
+  case ";${PROMPT_COMMAND};" in
+    *";${__halcyon_history_sync};"*) ;;
+    *) PROMPT_COMMAND="${__halcyon_history_sync}; ${PROMPT_COMMAND}" ;;
+  esac
+else
+  PROMPT_COMMAND="${__halcyon_history_sync}"
+fi
+unset __halcyon_history_sync
+
+# -----------------------------------------------------------------------------
+# S1. Halcyon soot/amber/signal-blue/moss color layer
+# -----------------------------------------------------------------------------
+
+# Hex fallbacks if colors.env was not created yet.
+export HALCYON_SOOT="${HALCYON_SOOT:-#07090D}"
+export HALCYON_SOOT_ALT="${HALCYON_SOOT_ALT:-#0B1118}"
+export HALCYON_PANEL="${HALCYON_PANEL:-#11151C}"
+export HALCYON_TEXT="${HALCYON_TEXT:-#F2E8D5}"
+export HALCYON_MUTED="${HALCYON_MUTED:-#9AA0AA}"
+export HALCYON_AMBER="${HALCYON_AMBER:-#FFBF00}"
+export HALCYON_BRASS="${HALCYON_BRASS:-#B88746}"
+export HALCYON_SIGNAL_BLUE="${HALCYON_SIGNAL_BLUE:-#4FA3B8}"
+export HALCYON_MOSS="${HALCYON_MOSS:-#8FA37A}"
+export HALCYON_RUST="${HALCYON_RUST:-#B7410E}"
+
+# Compatibility aliases for scripts that use older token names.
+export HALCYON_BG="${HALCYON_BG:-$HALCYON_SOOT}"
+export HALCYON_BG_ALT="${HALCYON_BG_ALT:-$HALCYON_SOOT_ALT}"
+export HALCYON_FG="${HALCYON_FG:-$HALCYON_TEXT}"
+export HALCYON_GOLD="${HALCYON_GOLD:-$HALCYON_AMBER}"
+export HALCYON_BLUE="${HALCYON_BLUE:-$HALCYON_SIGNAL_BLUE}"
+export HALCYON_GREEN="${HALCYON_GREEN:-$HALCYON_MOSS}"
+export HALCYON_RED="${HALCYON_RED:-$HALCYON_RUST}"
+
+# 256-color ANSI approximations.
+export HALCYON_ANSI_SOOT="${HALCYON_ANSI_SOOT:-232}"
+export HALCYON_ANSI_PANEL="${HALCYON_ANSI_PANEL:-233}"
+export HALCYON_ANSI_TEXT="${HALCYON_ANSI_TEXT:-230}"
+export HALCYON_ANSI_AMBER="${HALCYON_ANSI_AMBER:-214}"
+export HALCYON_ANSI_BRASS="${HALCYON_ANSI_BRASS:-172}"
+export HALCYON_ANSI_SIGNAL_BLUE="${HALCYON_ANSI_SIGNAL_BLUE:-39}"
+export HALCYON_ANSI_MOSS="${HALCYON_ANSI_MOSS:-107}"
+export HALCYON_ANSI_RUST="${HALCYON_ANSI_RUST:-166}"
+
+# Prompt/readline-safe escape helpers.
+__hc_reset='\[\e[0m\]'
+__hc_text="\[\e[38;5;${HALCYON_ANSI_TEXT}m\]"
+__hc_amber="\[\e[38;5;${HALCYON_ANSI_AMBER}m\]"
+__hc_blue="\[\e[38;5;${HALCYON_ANSI_SIGNAL_BLUE}m\]"
+__hc_moss="\[\e[38;5;${HALCYON_ANSI_MOSS}m\]"
+
+# Chroot-only prompt: no user@host:path. Defaults to debian-chroot when unset.
+if [[ -z "${debian_chroot:-}" && -r /etc/debian_chroot ]]; then
+  debian_chroot="$(< /etc/debian_chroot)"
+fi
+debian_chroot="${debian_chroot:-debian-chroot}"
+PS1="${__hc_amber}\${debian_chroot:+(\$debian_chroot)}${__hc_blue} \\$ ${__hc_reset}"
+
+# Set terminal title for xterm-compatible terminals without changing visible prompt.
+case "${TERM:-}" in
+  xterm*|rxvt*) PS1="\[\e]0;\${debian_chroot:+(\$debian_chroot)}\a\]${PS1}" ;;
+esac
+
+# ls / dircolors base, then Halcyon overlay.
+if [[ -x /usr/bin/dircolors ]]; then
+  if [[ -r "$HOME/.dircolors" ]]; then
+    eval "$(dircolors -b "$HOME/.dircolors")"
+  else
+    eval "$(dircolors -b)"
+  fi
+fi
+export LS_COLORS="${LS_COLORS:-}:di=01;38;5;${HALCYON_ANSI_SIGNAL_BLUE}:ln=01;38;5;${HALCYON_ANSI_AMBER}:ex=01;38;5;${HALCYON_ANSI_MOSS}:*.sh=01;38;5;${HALCYON_ANSI_MOSS}:*.bash=01;38;5;${HALCYON_ANSI_MOSS}:*.py=01;38;5;${HALCYON_ANSI_SIGNAL_BLUE}:*.m=01;38;5;${HALCYON_ANSI_AMBER}:*.md=38;5;${HALCYON_ANSI_TEXT}:*.txt=38;5;${HALCYON_ANSI_TEXT}:*.csv=38;5;${HALCYON_ANSI_BRASS}:*.json=38;5;${HALCYON_ANSI_BRASS}:*.log=38;5;${HALCYON_ANSI_RUST}:*.png=38;5;${HALCYON_ANSI_MOSS}:*.jpg=38;5;${HALCYON_ANSI_MOSS}:*.jpeg=38;5;${HALCYON_ANSI_MOSS}:*.pdf=38;5;${HALCYON_ANSI_AMBER}:*.zip=38;5;${HALCYON_ANSI_RUST}:*.tar=38;5;${HALCYON_ANSI_RUST}:*.gz=38;5;${HALCYON_ANSI_RUST}"
+
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias egrep='egrep --color=auto'
+export GREP_COLORS="ms=01;38;5;${HALCYON_ANSI_AMBER}:mc=01;38;5;${HALCYON_ANSI_AMBER}:sl=:cx=:fn=38;5;${HALCYON_ANSI_MOSS}:ln=38;5;${HALCYON_ANSI_SIGNAL_BLUE}:bn=38;5;${HALCYON_ANSI_BRASS}:se=38;5;${HALCYON_ANSI_RUST}"
+export GCC_COLORS="error=01;38;5;${HALCYON_ANSI_RUST}:warning=01;38;5;${HALCYON_ANSI_AMBER}:note=01;38;5;${HALCYON_ANSI_SIGNAL_BLUE}:caret=01;38;5;${HALCYON_ANSI_MOSS}:locus=38;5;${HALCYON_ANSI_TEXT}:quote=38;5;${HALCYON_ANSI_BRASS}"
+export LESS_TERMCAP_mb=$'\e[01;38;5;214m'
+export LESS_TERMCAP_md=$'\e[01;38;5;214m'
+export LESS_TERMCAP_me=$'\e[0m'
+export LESS_TERMCAP_se=$'\e[0m'
+export LESS_TERMCAP_so=$'\e[48;5;233;38;5;39m'
+export LESS_TERMCAP_ue=$'\e[0m'
+export LESS_TERMCAP_us=$'\e[04;38;5;107m'
+
+# -----------------------------------------------------------------------------
+# S2. Navigation and aliases
+# -----------------------------------------------------------------------------
+
+# Override interactive cd so every successful directory change lists contents.
+# This is the safe implementation of: alias cd='cd $1 && ls -lrt'
+cd() {
+  builtin cd "$@" || return
+  ls -lrt
+}
+
+mkcd() {
+  local dir="${1:?usage: mkcd <dir>}"
+  mkdir -p "$dir" && cd "$dir"
+}
+
+up() {
+  local levels="${1:-1}"
+  local path="."
+  local i
+  for ((i = 0; i < levels; i++)); do path="$path/.."; done
+  cd "$path"
+}
+
+# Listing.
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias lt='ls -lth'
+alias ltr='ls -ltrh'
+alias lsize='ls -lhS'
+
+# Navigation. cd() handles listing after successful movement.
+alias ..='cd ..'
+alias ...='cd ../..'
+alias ....='cd ../../..'
+alias down='cd "$HOME/Downloads"'
+alias vec='cd "$VEC_ROOT"'
+alias eng='cd "$ENGINEERING_DIR"'
+alias proj='cd "$ENGINEERING_DIR/projects/active"'
+alias logs='cd "$ENGINEERING_DIR/logs"'
+alias vault='cd "$VAULT_DIR"'
+alias bench='cd "$ENGINEERING_DIR/bench"'
+alias scratch='cd "$ENGINEERING_DIR/scratch"'
+
+# Shell utilities.
+alias c='clear'
+alias h='history'
+alias hg='history | grep -i'
+alias path='echo "$PATH" | tr ":" "\n"'
+alias reload='source ~/.bashrc'
+alias dfh='df -h'
+alias mem='free -h'
+alias mkdirp='mkdir -p'
+alias chmodx='chmod +x'
+alias sha='sha256sum'
+alias svim='sudo vim'
+alias please='sudo'
+alias svimrc='vim ~/.bashrc'
+alias editalias='vim ~/.operator_aliases'
+
+# Safer and more informative file operations.
+alias cp='cp -i'
+alias mv='mv -i'
+alias rm='rm -i'
+alias rmdir='rm -ri'
+alias cpv='cp -v'
+alias mvv='mv -v'
+alias untar='tar -xvf'
+alias targz='tar -czvf'
+alias ducks='du -h --max-depth=1 2>/dev/null | sort -h'
+alias diskbig='du -ah . 2>/dev/null | sort -h | tail -n 30'
+
+# Python/coding.
+alias py='python3'
+alias venv='python3 -m venv .venv && source .venv/bin/activate'
+alias activate='source .venv/bin/activate'
+alias pipup='python3 -m pip install --upgrade pip'
+alias pyclean='find . -type d -name "__pycache__" -prune -exec rm -rf {} +'
+alias findpy='find . -name "*.py"'
+alias findsh='find . -name "*.sh"'
+alias findcsv='find . -name "*.csv"'
+
+# Git quick-look.
+alias gitstat='git status --short --branch'
+alias gs='git status --short --branch'
+alias ga='git add'
+alias gc='git commit'
+alias gcm='git commit -m'
+alias gl='git log --oneline --graph --decorate --all -n 20'
+alias gd='git diff'
+alias gds='git diff --staged'
+alias gp='git push'
+alias gpl='git pull'
+
+# Hardware / bench helpers.
+alias ports='ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true'
+alias pyports='python3 -m serial.tools.list_ports'
+alias acm='ls -l /dev/ttyACM* 2>/dev/null || true'
+alias whoacm='lsof /dev/ttyACM0 2>/dev/null || true'
+alias killacm='lsof -t /dev/ttyACM0 2>/dev/null | xargs -r kill'
+alias nukeacm='lsof -t /dev/ttyACM0 2>/dev/null | xargs -r kill -9'
+alias mp='mpremote connect /dev/ttyACM0'
+alias mpls='mpremote connect /dev/ttyACM0 fs ls :/'
+alias mpcatcfg='mpremote connect /dev/ttyACM0 fs cat :/run_config.py'
+alias mpreset='mpremote connect /dev/ttyACM0 reset'
+alias i2cscan='i2cdetect -y 1'
+alias sensorscan='sensors'
+alias stresswatch='watch -n 1 sensors'
+alias cpuwatch='watch -n 1 "sensors && echo && free -h"'
+
+# Utility discovery.
+alias opcmd='alias | sort'
+alias opfind='alias | grep -i --color=auto'
+alias opaliases='grep -nE "^[[:space:]]*alias " ~/.bashrc ~/.bash_aliases ~/.operator_aliases 2>/dev/null'
+alias opaliasfind='grep -nEi "^[[:space:]]*alias .*" ~/.bashrc ~/.bash_aliases ~/.operator_aliases 2>/dev/null | grep -i --color=auto'
+alias opnames='alias | sed -E "s/^alias ([^=]+)=.*/\1/" | sort'
+
+# -----------------------------------------------------------------------------
+# S3. Operator functions
+# -----------------------------------------------------------------------------
+
+# Create a structured engineering project.
+mkproj() {
+  if [[ $# -lt 1 ]]; then echo "usage: mkproj <project-name>"; return 1; fi
+  local p="$ENGINEERING_DIR/projects/active/$1"
+  mkdir -p "$p"/{src,scripts,tests,config,data/raw,data/processed,data/synthetic,docs,notes,logs,output/figures,output/tables,output/reports,sandbox}
+  if [[ ! -f "$p/README.md" ]]; then
+    printf "# %s\n\n## Mission\n\n## System Under Test\n\n## Interfaces\n\n## Tests\n\n## Data / Evidence\n\n## Next Actions\n\n" "$1" > "$p/README.md"
+  fi
+  cd "$p" || return
+}
+
+# Open or create today's operator log folder.
+todaylog() {
+  local d; d="$(date +%Y-%m-%d)"
+  local p="$ENGINEERING_DIR/logs/$d"
+  mkdir -p "$p"
+  if [[ ! -f "$p/operator_log.md" ]]; then
+    printf "# %s — Operator Log\n\n## Topline\n- Energy:\n- Focus:\n- Main mission:\n\n## Work Blocks\n| Time | Mission | Result |\n|---|---|---|\n| | | |\n\n## Notes / Signals\n- \n\n## Shutdown\n- What changed?\n- Next physical action?\n" "$d" > "$p/operator_log.md"
+  fi
+  cd "$p" || return
+}
+
+# Make one quick dated note in fieldNotes.
+fieldnote() {
+  local name="${1:-note}"
+  local ts; ts="$(date +%Y%m%d_%H%M%S)"
+  local p="$ENGINEERING_DIR/fieldNotes/${ts}_${name}.md"
+  mkdir -p "$(dirname "$p")"
+  printf "# %s — %s\n\n## Observation\n- \n\n## Evidence\n- \n\n## Next check\n- \n" "$ts" "$name" > "$p"
+  ${EDITOR:-vim} "$p"
+}
+
+glados() {
+  local text="${1:?usage: glados <text>}"
+  builtin cd "$ENGINEERING_DIR/projects/active/GLaDOSTTS/src/GLaDOS" || return
+  uv run glados say "$text"
+  builtin cd - >/dev/null || return
+}
+
+# Simple room/system reset checklist.
+deskreset() {
+  cat <<'RESET'
+Desk reset / cockpit reset:
+[ ] Water visible
+[ ] Meds handled / checked
+[ ] One active notebook or file open
+[ ] Chargers returned to home
+[ ] Cups/trash cleared
+[ ] One next physical action chosen
+RESET
+}
+
+# Desktop alert for long-running commands. Use like: sleep 10; alert
+alias alert='notify-send --urgency=low -i "$([ $? = 0 ] && echo terminal || echo error)" "$(history | tail -n1 | sed -e '\''s/^\s*[0-9]\+\s*//;s/[;&|]\s*alert$//'\'')"'
+
+unset __hc_reset __hc_text __hc_amber __hc_blue __hc_moss
+EOF
+
+  # Source aliases and colors from ~/.bashrc exactly once.
+  append_once "$HOME/.bashrc" "# Operator aliases" '[[ -f "$HOME/.operator_aliases" ]] && source "$HOME/.operator_aliases"'
+  append_once "$HOME/.bashrc" "# Halcyon color tokens" '[[ -f "$HOME/.config/halcyon/colors.env" ]] && source "$HOME/.config/halcyon/colors.env"'
+
+  # Better readline behavior: search history by prefix with up/down arrows.
+  write_file_stream "$HOME/.inputrc" <<'EOF'
+# ~/.inputrc
+"\e[A": history-search-backward
+"\e[B": history-search-forward
+set completion-ignore-case on
+set show-all-if-ambiguous on
+set menu-complete-display-prefix on
+EOF
+}
+
+# ==============================================================================
+# S8: Terminal, VS Code, Obsidian configs
+# ==============================================================================
+
+setup_terminator(){
+  info "Creating Terminator Halcyon-dark config"
+
+  write_file_stream "$HOME/.config/terminator/config" <<EOF
+[global_config]
+  title_transmit_bg_color = "#3a2a00"
+  title_inactive_bg_color = "#1f1f1f"
+  title_receive_bg_color = "#4a3500"
+  inactive_color_offset = 0.85
+  suppress_multiple_term_dialog = True
+
+[keybindings]
+  split_horiz = <Primary><Shift>e
+  split_vert = <Primary><Shift>o
+  close_term = <Primary><Shift>w
+  new_tab = <Primary><Shift>t
+  next_tab = <Primary>Page_Down
+  prev_tab = <Primary>Page_Up
+
+[profiles]
+  [[default]]
+    background_color = "$HALCYON_BG"
+    background_darkness = 0.94
+    background_type = transparent
+    cursor_color = "$HALCYON_GOLD"
+    foreground_color = "$HALCYON_FG"
+    palette = "#1b1b1b:$HALCYON_RED:$HALCYON_GREEN:$HALCYON_GOLD:$HALCYON_BLUE:$HALCYON_PURPLE:$HALCYON_CYAN:$HALCYON_FG:#5c6370:#d98f84:#a3be8c:#e8c16a:#8fb7d6:#c7a0d9:#9bd3df:#fff4df"
+    font = Monospace 10
+    use_system_font = False
+    scrollback_infinite = True
+    copy_on_selection = True
+
+[layouts]
+  [[default]]
+    [[[window0]]]
+      type = Window
+      parent = ""
+    [[[terminal0]]]
+      type = Terminal
+      parent = window0
+
+[plugins]
+EOF
+}
+
+setup_vscode(){
+  info "Creating VS Code Halcyon-dark recommendations"
+
+  local vscode_settings='{
+  "workbench.colorTheme": "Default Dark Modern",
+  "window.autoDetectColorScheme": true,
+  "workbench.preferredDarkColorTheme": "Default Dark Modern",
+  "editor.fontFamily": "Monospace",
+  "editor.fontSize": 14,
+  "editor.rulers": [88, 100],
+  "editor.formatOnSave": false,
+  "editor.minimap.enabled": false,
+  "editor.bracketPairColorization.enabled": true,
+  "editor.guides.bracketPairs": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.copyOnSelection": true,
+  "terminal.integrated.minimumContrastRatio": 4.5,
+  "workbench.colorCustomizations": {
+    "terminal.background": "#0b0f14",
+    "terminal.foreground": "#eadfca",
+    "terminalCursor.foreground": "#d6a94a",
+    "activityBar.background": "#111827",
+    "sideBar.background": "#0b0f14",
+    "editor.background": "#0b0f14",
+    "editor.foreground": "#eadfca",
+    "statusBar.background": "#3a2a00",
+    "statusBar.foreground": "#fff4df"
+  }
+}
+'
+
+  # Always write a safe recommended copy in the engineering workspace.
+  write_file "$ENGINEERING_DIR/VSCode/settings.halcyon-dark.json" "$vscode_settings"
+
+  # Optionally write actual user settings. Safe on partially configured laptops:
+  # if settings.json already exists, skip unless --force is passed.
+  if (( SET_VSCODE_USER_SETTINGS )); then
+    write_file "$HOME/.config/Code/User/settings.json" "$vscode_settings"
+  else
+    warn "Skipping VS Code user settings because --no-vscode-user was set."
+  fi
+}
+
+setup_vault(){
+  info "Creating Obsidian work vault"
+
+  local dirs=(
+    00-Inbox 10-Daily 20-Projects 30-Systems 40-Test-Plans 45-VV-Matrices
+    50-Debug-Logs 60-Meetings 70-References 80-Templates 90-Archive
+    Attachments .obsidian .obsidian/snippets
+  )
+  for d in "${dirs[@]}"; do ensure_dir "$VAULT_DIR/$d"; done
+
+  write_file "$VAULT_DIR/README.md" '# Work Operator Vault
+
+Purpose: capture engineering notes, meetings, debug trails, project decisions, test plans, V&V matrices, and reusable systems knowledge.
+
+| Folder | Use |
+|---|---|
+| 00-Inbox | Fast capture before sorting |
+| 10-Daily | Daily plans, shutdown notes, work log |
+| 20-Projects | Project home notes and active work |
+| 30-Systems | System definitions and interfaces |
+| 40-Test-Plans | Verification plans and procedures |
+| 45-VV-Matrices | Requirements, evidence, acceptance criteria |
+| 50-Debug-Logs | Ambiguous failures and root cause notes |
+| 60-Meetings | Meeting notes and action items |
+| 70-References | Concepts, datasheets, standards |
+| 80-Templates | Reusable templates |
+| 90-Archive | Completed or stale notes |
+
+## Operating Rules
+- Capture first, organize second.
+- Every project gets a mission, boundary, interfaces, risks, and next action.
+- Every debug note preserves symptom, evidence, hypothesis, test, result.
+- Every V&V artifact should say what evidence would change our mind.
+'
+
+  write_file "$VAULT_DIR/80-Templates/Daily Note.md" '# {{date}} — Daily Operator Log
+
+## Topline
+- Energy:
+- Focus:
+- Main mission:
+- Constraint / risk:
+
+## Pre-flight
+- [ ] Calendar checked
+- [ ] Critical messages checked
+- [ ] One priority chosen
+- [ ] Water / food accounted for
+- [ ] Laptop power / charger accounted for
+
+## Work Blocks
+| Time | Mission | Result |
+|---|---|---|
+| | | |
+
+## Notes / Signals
+-
+
+## Decisions
+-
+
+## Shutdown
+- What changed today?
+- What is the next physical action?
+- What can wait?
+'
+
+  write_file "$VAULT_DIR/80-Templates/Project Home.md" '# Project — <Name>
+
+## Mission
+<What are we trying to make true?>
+
+## System Under Test
+| Level | Element |
+|---|---|
+| Main System | |
+| Subsystem A | |
+| Subsystem B | |
+
+## Success Criteria
+| ID | Criterion | Verification |
+|---|---|---|
+| SC-001 | | |
+
+## Interfaces
+| Interface | From | To | Flow Type | Notes |
+|---|---|---|---|---|
+| | | | Data / Power / Mechanical / Thermal / RF / Human | |
+
+## Risks / Assumptions
+| ID | Type | Statement | How to test / retire |
+|---|---|---|---|
+| ASM-001 | Assumption | | |
+| RISK-001 | Risk | | |
+
+## Next Actions
+- [ ]
+'
+
+  write_file "$VAULT_DIR/80-Templates/System Definition.md" '# System Definition — <System Name>
+
+## System Boundary
+| Field | Definition |
+|---|---|
+| System Under Test | |
+| Primary Function | |
+| User / Operator | |
+| Environment | |
+| Out of Scope | |
+
+## Subsystems
+| Subsystem | Role | Inputs | Outputs | Notes |
+|---|---|---|---|---|
+| | | | | |
+
+## Interfaces
+| ID | Interface | From | To | Flow Type | Failure Modes |
+|---|---|---|---|---|---|
+| IF-001 | | | | | |
+
+## Requirements
+| ID | Requirement | Verification Method | Status |
+|---|---|---|---|
+| SYS-REQ-001 | | Inspection / Analysis / Test / Demo | Draft |
+'
+
+  write_file "$VAULT_DIR/80-Templates/Test Plan.md" '# Test Plan — <Test Name>
+
+## Objective
+<What question does this test answer?>
+
+## Requirement(s) Covered
+| Requirement | Test Method |
+|---|---|
+| | |
+
+## Setup
+| Item | Value |
+|---|---|
+| Hardware | |
+| Firmware / Software | |
+| Environment | |
+| Instrumentation | |
+
+## Procedure
+1.
+2.
+3.
+
+## Data to Log
+| Signal | Units | Rate | Source |
+|---|---:|---:|---|
+| | | | |
+
+## Pass / Fail Criteria
+| Criterion | Pass Threshold |
+|---|---|
+| | |
+
+## Results
+| Run | Result | Notes |
+|---|---|---|
+| 001 | | |
+
+## Conclusion
+<What did we learn? What changes next?>
+'
+
+  write_file "$VAULT_DIR/80-Templates/VV Matrix.md" '# V&V Matrix — <System / Feature>
+
+| ID | Requirement / Claim | Method | Evidence | Acceptance Criteria | Status | Notes |
+|---|---|---|---|---|---|---|
+| VV-001 | | Inspection / Analysis / Test / Demo | | | Draft | |
+
+## Evidence Standard
+- What signal would confirm this?
+- What signal would falsify this?
+- What is the minimum evidence needed to trust the result?
+'
+
+  write_file "$VAULT_DIR/80-Templates/Debug Log.md" '# Debug Log — <Issue / Symptom>
+
+## Situation
+-
+
+## System Under Stress
+-
+
+## Ambiguous Symptom
+-
+
+## Expected Behavior
+-
+
+## Observed Behavior
+-
+
+## Evidence
+| Evidence | Source | Timestamp / Link |
+|---|---|---|
+| | | |
+
+## Hypotheses
+| ID | Hypothesis | Test | Result |
+|---|---|---|---|
+| H1 | | | |
+
+## Instrumentation / Checks
+- [ ] Logs
+- [ ] Power
+- [ ] Comms
+- [ ] Mechanical
+- [ ] Timing
+- [ ] Environment
+
+## Root Cause / Narrowed Cause
+-
+
+## Fix / Mitigation
+-
+
+## Prevention
+- Regression test:
+- Monitor / alert:
+- Documentation / playbook:
+'
+
+  write_file "$VAULT_DIR/80-Templates/Meeting Note.md" '# Meeting — <Topic> — {{date}}
+
+## Attendees
+-
+
+## Purpose
+-
+
+## Notes
+-
+
+## Decisions
+| Decision | Owner | Date |
+|---|---|---|
+| | | |
+
+## Action Items
+| Task | Owner | Due | Status |
+|---|---|---|---|
+| | | | |
+'
+
+  write_file "$VAULT_DIR/80-Templates/Decision Record.md" '# Decision Record — <Decision>
+
+## Status
+Proposed / Accepted / Superseded
+
+## Context
+-
+
+## Decision
+-
+
+## Options Considered
+| Option | Pros | Cons |
+|---|---|---|
+| | | |
+
+## Rationale
+-
+
+## Consequences
+| Positive | Negative / Risk |
+|---|---|
+| | |
+'
+
+  write_file "$VAULT_DIR/80-Templates/Part Datasheet Note.md" '# Part — <Part Number / Module>
+
+## Role
+-
+
+## Key Specs
+| Spec | Value |
+|---|---|
+| Voltage | |
+| Current | |
+| Interface | |
+| Range | |
+| Accuracy | |
+
+## Pinout
+~~~
+Pin 1:
+Pin 2:
+Pin 3:
+Pin 4:
+~~~
+
+## Test Notes
+-
+
+## Driver / Code Notes
+-
+'
+
+  write_file "$VAULT_DIR/.obsidian/app.json" '{
+  "attachmentFolderPath": "Attachments",
+  "alwaysUpdateLinks": true,
+  "newFileLocation": "folder",
+  "newFileFolderPath": "00-Inbox",
+  "cssTheme": ""
+}
+'
+  write_file "$VAULT_DIR/.obsidian/templates.json" '{
+  "folder": "80-Templates",
+  "dateFormat": "YYYY-MM-DD",
+  "timeFormat": "HH:mm"
+}
+'
+  write_file "$VAULT_DIR/.obsidian/daily-notes.json" '{
+  "folder": "10-Daily",
+  "format": "YYYY-MM-DD",
+  "template": "80-Templates/Daily Note.md"
+}
+'
+  write_file "$VAULT_DIR/.obsidian/appearance.json" '{
+  "theme": "obsidian",
+  "cssTheme": "",
+  "enabledCssSnippets": [
+    "halcyon-dark"
+  ]
+}
+'
+  write_file_stream "$VAULT_DIR/.obsidian/snippets/halcyon-dark.css" <<EOF
+:root {
+  --background-primary: $HALCYON_BG;
+  --background-secondary: $HALCYON_BG_ALT;
+  --text-normal: $HALCYON_FG;
+  --text-muted: $HALCYON_MUTED;
+  --interactive-accent: $HALCYON_GOLD;
+  --text-accent: $HALCYON_GOLD;
+  --code-background: $HALCYON_PANEL;
+  --blockquote-border-color: $HALCYON_BRASS;
+}
+EOF
+
+}
+
+# ==============================================================================
+# S9: Helper scripts in ~/.local/bin
+# ==============================================================================
+
+setup_helper_scripts(){
+  info "Creating local helper scripts"
+
+  write_file_stream "$LOCAL_BIN/operator-status" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$HOME/.config/halcyon/colors.env" 2>/dev/null || true
+VEC_ROOT="${VEC_ROOT:-$HOME/Vec}"
+ENGINEERING_DIR="${ENGINEERING_DIR:-$VEC_ROOT/Engineering}"
+VAULT_DIR="${VAULT_DIR:-$VEC_ROOT/Vaults/Work}"
+echo "Operator status — $(date '+%Y-%m-%d %H:%M')"
+echo "Theme: ${HALCYON_THEME:-unknown}"
+echo "Vec root: $VEC_ROOT"
+echo "Engineering: $ENGINEERING_DIR"
+echo "Vault: $VAULT_DIR"
+echo
+echo "Disk:"
+df -h "$HOME" | tail -n +1
+echo
+echo "Memory:"
+free -h 2>/dev/null || true
+echo
+echo "Serial ports:"
+ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || echo "none detected"
+EOF
+
+  write_file "$LOCAL_BIN/vecbin" '#!/usr/bin/env bash
+# Symlink a file into ~/.local/bin so it can be called from anywhere.
+# Usage:
+#   vecbin ./plot.py plot
+#   vecbin --force ./plot.py plot
+set -euo pipefail
+FORCE=0
+if [[ "${1:-}" == "-f" || "${1:-}" == "--force" ]]; then FORCE=1; shift; fi
+SRC="${1:-}"
+NAME="${2:-}"
+[[ -n "$SRC" ]] || { echo "usage: vecbin [--force] <source-file> [command-name]" >&2; exit 2; }
+[[ -e "$SRC" ]] || { echo "vecbin: source does not exist: $SRC" >&2; exit 1; }
+SRC="$(realpath "$SRC")"
+if [[ -z "$NAME" ]]; then NAME="$(basename "$SRC")"; fi
+BIN_DIR="$HOME/.local/bin"
+DEST="$BIN_DIR/$NAME"
+mkdir -p "$BIN_DIR"
+case ":$PATH:" in *":$BIN_DIR:"*) ;; *) echo "vecbin: warning: $BIN_DIR is not on PATH for this shell" >&2 ;; esac
+if [[ -e "$DEST" || -L "$DEST" ]]; then
+  if (( FORCE )); then rm -f "$DEST"; else echo "vecbin: destination exists: $DEST  Use --force" >&2; exit 1; fi
+fi
+chmod +x "$SRC" 2>/dev/null || true
+ln -s "$SRC" "$DEST"
+hash -r 2>/dev/null || true
+echo "Linked: $DEST -> $SRC"
+'
+
+  write_file "$LOCAL_BIN/csvpeek" '#!/usr/bin/env python3
+"""Small CSV quicklook helper."""
+from __future__ import annotations
+import csv
+import sys
+from pathlib import Path
+
+if len(sys.argv) != 2:
+    print("usage: csvpeek <file.csv>", file=sys.stderr)
+    raise SystemExit(2)
+
+path = Path(sys.argv[1]).expanduser()
+if not path.exists():
+    print(f"csvpeek: not found: {path}", file=sys.stderr)
+    raise SystemExit(1)
+
+with path.open(newline="", encoding="utf-8", errors="replace") as f:
+    reader = csv.reader(f)
+    rows = []
+    for i, row in enumerate(reader):
+        rows.append(row)
+        if i >= 5:
+            break
+
+print(f"File: {path}")
+print(f"Size: {path.stat().st_size:,} bytes")
+if not rows:
+    print("Empty file")
+    raise SystemExit(0)
+cols = ", ".join(rows[0])
+print(f"Columns ({len(rows[0])}): {cols}")
+print("Preview:")
+for row in rows[1:]:
+    print("  " + " | ".join(row))
+'
+
+  write_file "$LOCAL_BIN/cleanup-downloads" '#!/usr/bin/env bash
+# Organize ~/Downloads by file type. Dry-run by default.
+set -euo pipefail
+APPLY=0
+DOWNLOADS="${DOWNLOADS:-$HOME/Downloads}"
+while (($#)); do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --dry-run) APPLY=0 ;;
+    --downloads) shift; DOWNLOADS="${1:?missing path}" ;;
+    -h|--help) echo "usage: cleanup-downloads [--apply] [--downloads DIR]"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+run(){ if (( APPLY )); then "$@"; else printf "[DRY RUN] "; printf "%q " "$@"; printf "\n"; fi; }
+move_ext(){
+  local dest="$1"; shift
+  run mkdir -p "$DOWNLOADS/$dest"
+  find "$DOWNLOADS" -maxdepth 1 -type f \( "$@" \) -print0 | while IFS= read -r -d "" f; do
+    run mv -v "$f" "$DOWNLOADS/$dest/"
+  done
+}
+move_ext pdf     -iname "*.pdf"
+move_ext images  -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.gif" -o -iname "*.webp" -o -iname "*.svg" -o -iname "*.heic" -o -iname "*.avif"
+move_ext scripts -iname "*.sh" -o -iname "*.py" -o -iname "*.mat" -o -iname "*.ipynb"
+move_ext docs    -iname "*.txt" -o -iname "*.md" -o -iname "*.doc" -o -iname "*.docx" -o -iname "*.ppt" -o -iname "*.pptx" -o -iname "*.xls" -o -iname "*.xlsx" -o -iname "*.csv"
+move_ext archive -iname "*.zip" -o -iname "*.tar" -o -iname "*.gz" -o -iname "*.tgz" -o -iname "*.7z" -o -iname "*.bak"
+move_ext audio   -iname "*.mp3" -o -iname "*.wav" -o -iname "*.flac" -o -iname "*.m4a" -o -iname "*.ogg"
+move_ext video   -iname "*.mp4" -o -iname "*.mov" -o -iname "*.mkv" -o -iname "*.webm"
+echo "Done. Re-run with --apply to move files." >&2
+'
+
+  # Make generated helpers executable when applying.
+  run chmod +x "$LOCAL_BIN/operator-status" "$LOCAL_BIN/vecbin" "$LOCAL_BIN/csvpeek" "$LOCAL_BIN/cleanup-downloads"
+}
+
+# ==============================================================================
+# S10: Permissions, manifest, and final report
+# ==============================================================================
+
+setup_groups(){
+  # Serial/I2C permissions are useful for microcontrollers and bench hardware.
+  # This is intentionally optional-ish: usermod requires re-login and may fail in
+  # containers, weird managed laptops, or locked-down systems.
+  local target_user
+  target_user="${USER:-$(id -un 2>/dev/null || true)}"
+  if [[ -z "$target_user" ]]; then
+    warn "Could not determine current username; skipping dialout/i2c group setup."
+    return 0
+  fi
+
+  if (( APPLY )); then
+    if have_cmd sudo; then
+      info "Adding user to dialout and i2c groups when available"
+      getent group dialout >/dev/null 2>&1 && run_optional sudo usermod -aG dialout "$target_user"
+      getent group i2c >/dev/null 2>&1 && run_optional sudo usermod -aG i2c "$target_user"
+    else
+      warn "sudo not found; skipping dialout/i2c group setup."
+    fi
+  else
+    echo "[DRY RUN optional] sudo usermod -aG dialout/i2c $target_user"
+  fi
+  return 0
+}
+
+write_manifest(){
+  info "Writing bootstrap manifest"
+  write_file "$MANIFEST_DIR/operator_laptop_bootstrap_${RUN_ID}.txt" "run_id=$RUN_ID\ntimestamp=$(timestamp)\nscript=$SCRIPT_NAME\nscript_dir=$SCRIPT_DIR\nversion=$VERSION\nauthor=$AUTHOR\napply=$APPLY\nforce=$FORCE\nvec_root=$VEC_ROOT\nengineering_dir=$ENGINEERING_DIR\nvault_dir=$VAULT_DIR\ndo_install=$DO_INSTALL\ninstall_obsidian=$INSTALL_OBSIDIAN\napply_system_theme=$APPLY_SYSTEM_THEME\nset_vscode_user_settings=$SET_VSCODE_USER_SETTINGS\n"
+}
+
+print_next(){
+  cat <<EOF
+
+===============================================================================
+Operator laptop bootstrap v$VERSION complete.
+===============================================================================
+
+Mode:
+  APPLY=$APPLY
+  FORCE=$FORCE
+  DO_INSTALL=$DO_INSTALL
+
+Managed paths:
+  Vec root:     $VEC_ROOT
+  Engineering:  $ENGINEERING_DIR
+  Vault:        $VAULT_DIR
+  Terminator:   $HOME/.config/terminator/config
+  Helpers:      $HOME/.operator_aliases
+  Local bin:    $LOCAL_BIN
+  Theme tokens: $HALCYON_CONFIG_DIR/colors.env
+
+Next steps:
+  source ~/.bashrc
+  operator-status
+  terminator
+
+Useful commands after sourcing ~/.bashrc:
+  cd <dir>             # change dir, then list contents with ls -lrt
+  eng                  # jump to engineering workspace
+  proj                 # active projects
+  mkproj <name>        # create a structured project
+  todaylog             # open today's log folder
+  fieldnote <name>     # create a quick field note
+  cleanup-downloads    # dry-run Downloads cleanup
+  cleanup-downloads --apply
+  vecbin ./script.sh name
+  csvpeek data.csv
+
+Obsidian:
+  Open folder as vault -> $VAULT_DIR
+  Enable CSS snippets -> halcyon-dark
+  Confirm Templates folder = 80-Templates
+  Confirm Daily Notes folder = 10-Daily
+
+Optional Git identity:
+  git config --global user.name "V Halcyon"
+  git config --global user.email "<work-or-personal-email>"
+  git config --global init.defaultBranch main
+
+EOF
+  if (( ! APPLY )); then
+    echo "Dry run only. Apply with: bash $SCRIPT_NAME --apply"
+  fi
+}
+
+cleanup(){
+  local status=$?
+  if (( status != 0 )); then
+    warn "Script exited with status $status"
+  fi
+}
+trap cleanup EXIT
+
+# ==============================================================================
+# S11: Main workflow
+# ==============================================================================
+
+main(){
+  parse_args "$@"
+  info "Starting operator laptop bootstrap v$VERSION"
+  print_change_plan
+  install_packages
+  setup_dirs
+  setup_halcyon_color_tokens
+  setup_system_theme
+  setup_mplstyle
+  setup_shell
+  setup_terminator
+  setup_vscode
+  setup_vault
+  setup_helper_scripts
+  setup_groups
+  write_manifest
+  print_next
+}
+
+main "$@"
