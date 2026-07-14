@@ -4,7 +4,8 @@
 # Generic Bash template for engineering/operator automation.
 #
 # Pattern:
-#   parse_args -> validate_config -> run_workflow
+#   parse_args ->   self-test       -> run_workflow
+#                   validate_config -> run_workflow
 #
 # Operator rules:
 #   - Dry-run is default for risky actions.
@@ -12,6 +13,7 @@
 #   - Quote variables unless you intentionally want word splitting.
 #   - Use arrays for commands instead of eval.
 #   - Keep main guarded so tests can source this file.
+
 # =============================================================================
 # region S0. Metadata / globals
 # =============================================================================
@@ -313,7 +315,7 @@ validate_config() {
 
     if [[ -n "$INPUT_PATH" ]]; then
         [[ "$INPUT_PATH" == "/home/jess/Vec/Engineering/projects/active/test_dir" ]] &&
-            mkdir -p "$INPUT_PATH" && info "Created $INPUT_PATH";
+            mkdir -p "$INPUT_PATH" && info "Checked $INPUT_PATH created";
     else
     warn "No --input provided";
     fi
@@ -360,6 +362,12 @@ run_self_test() {
     run_workflow
     assert_file_exists "$OUTPUT_DIR/logs/run_manifest_${RUN_ID}.txt"
     assert_file_exists "$OUTPUT_DIR/logs/summary_${RUN_ID}.txt"
+    if (( VERBOSE )); then
+        debug "First 5 lines run_manifest:";
+        head -n 5 "$OUTPUT_DIR/logs/run_manifest_${RUN_ID}.txt"
+        debug "First 5 lines summary:"
+        head -n 5 "$OUTPUT_DIR/logs/summary_${RUN_ID}.txt"
+    fi
     APPLY="$old_apply"
     OUTPUT_DIR="$old_output"
     rm -rf "$tmp_dir"
@@ -373,6 +381,8 @@ run_self_test() {
 # =============================================================================
 
 main() {
+    install_runtime
+
     parse_args "$@"
 
     if (( SELF_TEST )); then
