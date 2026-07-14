@@ -12,15 +12,11 @@
 #   - Quote variables unless you intentionally want word splitting.
 #   - Use arrays for commands instead of eval.
 #   - Keep main guarded so tests can source this file.
-
-set -Eeuo pipefail
-IFS=$'\n\t'
-
 # =============================================================================
 # region S0. Metadata / globals
 # =============================================================================
 
-VERSION="3.1.0"
+VERSION="3.1.3"
 AUTHOR="V Halcyon"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
@@ -54,19 +50,62 @@ debug() { (( VERBOSE )) && printf "%s[DEBUG]%s %s\n" "$(_color '0;36')" "$(_rese
 die() { err "$*"; exit 1; }
 timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
-on_error() {
-    local status=$?
-    local line=${BASH_LINENO[0]:-unknown}
-    err "Failed at line ${line} with status ${status}."
-    exit "$status"
+ROOT_BASHPID=""
+ERROR_REPORTED=0
+CLEANUP_RAN=0
+
+install_runtime() {
+    set -Eeuo pipefail
+    IFS=$'\n\t'
+
+    ROOT_BASHPID="$BASHPID"
+
+    trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+    trap 'cleanup "$?"' EXIT
 }
-trap on_error ERR
+
+on_error() {
+    local status="$1"
+    local line="$2"
+    local command="$3"
+
+    # Ignore duplicate reports from command-substitution and pipeline subshells.
+    [[ "$BASHPID" == "$ROOT_BASHPID" ]] || return 0
+
+    # Ignore additional ERR events after the first root-shell report.
+    if (( ERROR_REPORTED )); then
+        return 0
+    fi
+    ERROR_REPORTED=1
+
+    printf 'OOPS: command failed\n' >&2
+    printf '    exit code: %d\n' "$status" >&2
+    printf '    line: %d\n' "$line" >&2
+    printf '    command: %s\n' "$command" >&2
+    printf '    process: %s\n' "$BASHPID" >&2
+    printf '    function: %s\n' "${FUNCNAME[1]:-main}" >&2
+}
 
 cleanup() {
-    local status=$?
-    (( status == 0 )) && debug "Cleanup complete." || warn "Script exited with status ${status}."
+    local status="$1"
+
+    # Only clean up from the shell that actually started main.
+    [[ "$BASHPID" == "$ROOT_BASHPID" ]] || return 0
+
+    if (( CLEANUP_RAN )); then
+        return 0
+    fi
+    CLEANUP_RAN=1
+
+    # Prevent accidental re-entry while cleanup itself executes.
+    trap - EXIT
+
+    if (( status == 0 )); then
+        debug "Cleanup complete."
+    else
+        warn "Script exited with status ${status}."
+    fi
 }
-trap cleanup EXIT
 
 # endregion
 
@@ -217,13 +256,20 @@ SUMMARY
 
 usage() {
     cat <<USAGE
-Usage: $SCRIPT_NAME [options]
+# ┌──────────────────────────────────────────────┐
+# │                  V / H                       │
+# │              VEC HALCYON                     │
+# │       BASH OPERATOR TEMPLATE v${VERSION}          │
+# │  OBSERVE • VALIDATE • DEBUG • PROTECT        │
+# └──────────────────────────────────────────────┘
+
+Usage: ${SCRIPT_NAME} [options]
 
 Options:
   --apply                 Actually perform actions. Default is dry-run.
   --dry-run               Print actions without changing anything.
   --input PATH            Optional input file or directory.
-  --output-dir DIR        Output directory. Default: $OUTPUT_DIR
+  --output-dir DIR        Output directory. Default: ${OUTPUT_DIR}
   --force                 Replace generated files after backing them up.
   -v, --verbose           Enable debug logging.
   --self-test             Run a smoke test in /tmp.
@@ -231,16 +277,16 @@ Options:
   -h, --help              Show this help.
 
 Examples:
-  $SCRIPT_NAME --input data/raw/example.csv
-  $SCRIPT_NAME --apply --input data/raw/example.csv --output-dir output
-  $SCRIPT_NAME --self-test
+  ${SCRIPT_NAME} --input data/raw/example.csv
+  ${SCRIPT_NAME} --apply --input data/raw/example.csv --output-dir output
+  ${SCRIPT_NAME} --self-test
 
 Syntax crib:
-  Array command:   cmd=(python3 script.py --input "$INPUT_PATH"); run_cmd "\${cmd[@]}"
-  If test:         if [[ -f "$INPUT_PATH" ]]; then log "exists"; fi
-  Loop files:      while IFS= read -r file; do echo "$file"; done < <(find . -type f)
+  Array command:   cmd=(python3 script.py --input "\$path"); run_cmd "\${cmd[@]}"
+  If test:         if [[ -f "\$path" ]]; then log "exists"; fi
+  Loop files:      while IFS= read -r file; do echo "\$file"; done < <(find . -type f)
   Arithmetic:      if (( count > 3 )); then warn "large"; fi
-  Case matching:   case "$arg" in start|stop) ;; *) die "bad" ;; esac
+  Case matching:   case "\${1:-}" in start|stop) ;; *) die "bad" ;; esac
 USAGE
 }
 
@@ -264,11 +310,14 @@ parse_args() {
 
 validate_config() {
     [[ -n "$OUTPUT_DIR" ]] || die "--output-dir cannot be empty"
+
     if [[ -n "$INPUT_PATH" ]]; then
-        [[ -e "$INPUT_PATH" ]] || die "--input does not exist: $INPUT_PATH"
+        [[ "$INPUT_PATH" == "/home/jess/Vec/Engineering/projects/active/test_dir" ]] &&
+            mkdir -p "$INPUT_PATH" && info "Created $INPUT_PATH";
     else
-        warn "No --input provided; continuing with template behavior."
+    warn "No --input provided";
     fi
+    [[ -e "$INPUT_PATH" ]] || die "--input does not exist: $INPUT_PATH"
 }
 
 # endregion
@@ -304,7 +353,9 @@ run_self_test() {
     old_output="$OUTPUT_DIR"
     APPLY=1
     OUTPUT_DIR="$tmp_dir/output"
-    INPUT_PATH=""
+    INPUT_PATH="${INPUT_PATH:-${tmp_dir}}"
+    info "Output Directory: $OUTPUT_DIR"
+    info "Input Path: $INPUT_PATH"
     validate_config
     run_workflow
     assert_file_exists "$OUTPUT_DIR/logs/run_manifest_${RUN_ID}.txt"
@@ -323,6 +374,7 @@ run_self_test() {
 
 main() {
     parse_args "$@"
+
     if (( SELF_TEST )); then
         run_self_test
     else
